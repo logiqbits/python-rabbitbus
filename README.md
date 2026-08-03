@@ -20,7 +20,7 @@ It implements the same messaging patterns and AMQP conventions as the Go library
 From PyPI (after publish):
 
 ```bash
-pip install rabbitbus
+pip install logiqbits-rabbitbus
 ```
 
 For local development:
@@ -34,7 +34,7 @@ poetry install
 ## Quick start
 
 ```python
-from rabbitbus import new, BusMessage, Message, Durable
+from rabbitbus import builder, BusMessage, Message, Durable
 
 
 class Command1(Message):
@@ -46,7 +46,7 @@ class Command1(Message):
 
 
 bus = (
-    new()
+    builder()
     .bus("amqp://guest:guest@localhost")
     .with_policies(Durable())
     .build("python.svc")
@@ -90,7 +90,7 @@ bus.register_message_type(Reply1)
 ### Command-Reply
 
 ```python
-from rabbitbus import new, BusMessage, Message, Durable
+from rabbitbus import builder, BusMessage, Message, Durable
 
 
 class Command1(Message):
@@ -110,7 +110,7 @@ class Reply1(Message):
 
 
 bus = (
-    new()
+    builder()
     .bus("amqp://guest:guest@localhost")
     .with_policies(Durable())
     .build("python.svc")
@@ -133,7 +133,7 @@ bus.send("another.svc", BusMessage(Command1(data="hello")))
 ### Publish/Subscribe
 
 ```python
-from rabbitbus import new, BusMessage, Message, Durable
+from rabbitbus import builder, BusMessage, Message, Durable
 
 
 class OrderCreated(Message):
@@ -145,7 +145,7 @@ class OrderCreated(Message):
 
 
 bus = (
-    new()
+    builder()
     .bus("amqp://guest:guest@localhost")
     .with_policies(Durable())
     .build("notifications.svc")
@@ -167,7 +167,7 @@ bus.publish("events", "order.created", BusMessage(OrderCreated(order_id="123")))
 ### RPC
 
 ```python
-from rabbitbus import new, BusMessage, Message, Durable
+from rabbitbus import builder, BusMessage, Message, Durable
 
 
 class RpcRequest(Message):
@@ -187,7 +187,7 @@ class RpcResponse(Message):
 
 
 bus = (
-    new()
+    builder()
     .bus("amqp://guest:guest@localhost")
     .with_policies(Durable())
     .build("python.rpc.svc")
@@ -257,7 +257,7 @@ The builder supports the same style of configuration as the Go library:
 
 ```python
 bus = (
-    new()
+    builder()
     .bus("amqp://guest:guest@localhost")
     .with_policies(Durable())
     .worker_num(workers=4, prefetch_count=10)

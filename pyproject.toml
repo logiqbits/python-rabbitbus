@@ -1,6 +1,6 @@
 [project]
-name = "rabbitbus"
-version = "0.1.0"
+name = "logiqbits-rabbitbus"
+version = "0.1.1"
 description = "RabbitMQ service bus for Python, compatible with go-rabbitbus"
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,6 +29,9 @@ dependencies = [
 Homepage = "https://github.com/logiqbits/python-rabbitbus"
 Repository = "https://github.com/logiqbits/python-rabbitbus"
 Issues = "https://github.com/logiqbits/python-rabbitbus/issues"
+
+[tool.poetry]
+packages = [{include = "rabbitbus"}]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

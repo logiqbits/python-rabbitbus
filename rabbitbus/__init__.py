@@ -1,12 +1,18 @@
-from .builder import Builder, new
+from .builder import Builder
 from .bus import DefaultBus
 from .invocation import Invocation
 from .messages import BusMessage, Message
 from .policies import Durable, NonDurable
 from .serialization import JsonSerializer, Serializer
 
+
+def builder() -> Builder:
+    """Create a new bus builder."""
+    return Builder()
+
+
 __all__ = [
-    "new",
+    "builder",
     "Builder",
     "DefaultBus",
     "Invocation",

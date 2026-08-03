@@ -1,7 +1,7 @@
 import logging
 import time
 
-from rabbitbus import new, BusMessage, Message, Durable
+from rabbitbus import builder, BusMessage, Message, Durable
 
 logging.basicConfig(level=logging.INFO)
 
@@ -51,7 +51,7 @@ def main():
     svc_name = "python.e2e.service"
 
     bus = (
-        new()
+        builder()
         .bus(conn)
         .with_policies(Durable())
         .purge_on_startup()
