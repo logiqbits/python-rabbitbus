@@ -2,14 +2,33 @@
 name = "rabbitbus"
 version = "0.1.0"
 description = "RabbitMQ service bus for Python, compatible with go-rabbitbus"
+readme = "README.md"
+license = "Apache-2.0"
 authors = [
     {name = "logiqbits"}
 ]
 requires-python = ">=3.8"
+keywords = ["rabbitmq", "service-bus", "messaging", "go-rabbitbus"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "pika (>=1.3.0)"
 ]
 
+[project.urls]
+Homepage = "https://github.com/logiqbits/python-rabbitbus"
+Repository = "https://github.com/logiqbits/python-rabbitbus"
+Issues = "https://github.com/logiqbits/python-rabbitbus/issues"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
