@@ -95,6 +95,7 @@ class DefaultBus:
         self._registrations: List[_Registration] = []
         self._rpc_handlers_lock = threading.Lock()
         self._rpc_handlers: Dict[str, Callable[[BusMessage], None]] = {}
+        self._publisher_lock = threading.Lock()
 
         self._consumer_connection: Optional[pika.BlockingConnection] = None
         self._publisher_connection: Optional[pika.BlockingConnection] = None
@@ -346,28 +347,119 @@ class DefaultBus:
         request: BusMessage,
         timeout: float = 5.0,
     ) -> BusMessage:
+        """RPC using a dedicated short-lived connection.
+
+        The consumer connection may be blocked by a long-running handler, so we
+        use a fresh connection for the request and its reply instead of relying
+        on the shared bus consumer loop.
+        """
         rpc_id = uuid.uuid4().hex
         request.rpc_id = rpc_id
         request.semantics = "cmd"
 
-        reply_event = threading.Event()
-        reply_box: List[BusMessage] = []
+        params = pika.URLParameters(self.amqp_url)
+        params.blocked_connection_timeout = timeout + 10
+        conn = pika.BlockingConnection(params)
+        try:
+            ch = conn.channel()
+            reply_queue = ch.queue_declare(
+                queue="", exclusive=True, auto_delete=True
+            ).method.queue
 
-        def callback(msg: BusMessage) -> None:
-            reply_box.append(msg)
-            reply_event.set()
+            reply_event = threading.Event()
+            reply_box: List[BusMessage] = []
 
-        with self._rpc_handlers_lock:
-            self._rpc_handlers[rpc_id] = callback
+            def _on_reply(
+                _ch: BlockingChannel,
+                _method: pika.frame.Method,
+                props: pika.BasicProperties,
+                body: bytes,
+            ) -> None:
+                try:
+                    reply_box.append(self._extract_bus_message(props, body, ""))
+                except Exception as e:
+                    logger.error("failed to decode RPC reply: %s", e)
+                reply_event.set()
+                _ch.stop_consuming()
 
-        self._send_raw("", service, request, reply_to=self._rpc_queue)
+            ch.basic_consume(
+                queue=reply_queue,
+                on_message_callback=_on_reply,
+                auto_ack=True,
+            )
 
-        if not reply_event.wait(timeout=timeout):
-            with self._rpc_handlers_lock:
-                self._rpc_handlers.pop(rpc_id, None)
-            raise TimeoutError(f"RPC call to {service} timed out")
+            body = self.serializer.encode(request.payload)
+            properties = pika.BasicProperties(
+                message_id=request.id,
+                correlation_id=request.correlation_id,
+                reply_to=reply_queue,
+                content_encoding=self.serializer.name(),
+                headers=request.to_amqp_headers(),
+                delivery_mode=2,  # persistent
+            )
+            for policy in self.default_policies:
+                policy.apply(properties)
 
-        return reply_box[0]
+            ch.basic_publish(
+                exchange="",
+                routing_key=service,
+                body=body,
+                properties=properties,
+            )
+
+            deadline = time.time() + timeout
+            while not reply_event.is_set() and time.time() < deadline:
+                conn.process_data_events(time_limit=min(1.0, deadline - time.time()))
+
+            if not reply_event.is_set():
+                raise TimeoutError(f"RPC call to {service} timed out")
+
+            return reply_box[0]
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _ensure_publisher_channel(self) -> BlockingChannel:
+        """Return an open publisher channel, reconnecting if necessary.
+
+        The publisher connection can be reset by the broker when it sits idle
+        during a long-running handler. Force a health check and reconnect if
+        the channel or connection is dead.
+        """
+        if self._publisher_channel is not None and self._publisher_channel.is_open:
+            try:
+                if self._publisher_connection is not None:
+                    self._publisher_connection.process_data_events(0)
+                return self._publisher_channel
+            except Exception:
+                pass
+
+        if (
+            self._publisher_connection is not None
+            and self._publisher_connection.is_open
+        ):
+            try:
+                self._publisher_channel = self._publisher_connection.channel()
+                return self._publisher_channel
+            except Exception:
+                pass
+
+        try:
+            if self._publisher_connection is not None:
+                self._publisher_connection.close()
+        except Exception:
+            pass
+
+        self._publisher_connection = None
+        self._publisher_channel = None
+        self._publisher_connection = pika.BlockingConnection(
+            pika.URLParameters(self.amqp_url)
+        )
+        self._publisher_channel = self._publisher_connection.channel()
+        logger.warning("rabbitmq publisher reconnected")
+        return self._publisher_channel
 
     def _send_raw(
         self,
@@ -391,12 +483,38 @@ class DefaultBus:
         for policy in self.default_policies:
             policy.apply(properties)
 
-        self._publisher_channel.basic_publish(
-            exchange=exchange,
-            routing_key=routing_key,
-            body=body,
-            properties=properties,
-        )
+        def _do_publish() -> None:
+            channel = self._ensure_publisher_channel()
+            channel.basic_publish(
+                exchange=exchange,
+                routing_key=routing_key,
+                body=body,
+                properties=properties,
+            )
+
+        with self._publisher_lock:
+            try:
+                _do_publish()
+            except (
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ConnectionWrongStateError,
+                pika.exceptions.AMQPConnectionError,
+                pika.exceptions.ChannelWrongStateError,
+            ) as exc:
+                logger.warning(
+                    "rabbitmq publish failed (%s), reconnecting and retrying once", exc
+                )
+                try:
+                    if (
+                        self._publisher_connection is not None
+                        and self._publisher_connection.is_open
+                    ):
+                        self._publisher_connection.close()
+                except Exception:
+                    pass
+                self._publisher_connection = None
+                self._publisher_channel = None
+                _do_publish()
 
     def shutdown(self) -> None:
         self._started = False
