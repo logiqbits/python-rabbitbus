@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 MessageHandler = Callable[[Invocation, BusMessage], Any]
 
 
+class PublishError(Exception):
+    """A message was not confirmed as delivered by the broker.
+
+    Raised instead of silently dropping when publisher confirms fail
+    (nack), the message is unroutable (mandatory publish returned), or
+    the publish keeps failing after one reconnect+retry.
+    """
+
+
 def _wildcard_match(input_text: str, pattern: str) -> bool:
     in_parts = input_text.lower().split(".")
     pat_parts = pattern.lower().split(".")
@@ -80,6 +89,7 @@ class DefaultBus:
         prefetch_count: int = 1,
         purge_on_startup: bool = False,
         dlx: Optional[str] = None,
+        heartbeat: Optional[int] = 30,
     ):
         self.amqp_url = amqp_url
         self.svc_name = svc_name
@@ -89,6 +99,9 @@ class DefaultBus:
         self.prefetch_count = prefetch_count
         self.purge_on_startup = purge_on_startup
         self.dlx = dlx
+        # None keeps the URL value; an int is applied to every connection the
+        # bus opens so the URL can no longer silently disable heartbeats.
+        self.heartbeat = heartbeat
 
         self._started = False
         self._handlers_lock = threading.Lock()
@@ -96,6 +109,9 @@ class DefaultBus:
         self._rpc_handlers_lock = threading.Lock()
         self._rpc_handlers: Dict[str, Callable[[BusMessage], None]] = {}
         self._publisher_lock = threading.Lock()
+        self._inflight_cond = threading.Condition()
+        self._inflight = 0
+        self._io_thread: Optional[threading.Thread] = None
 
         self._consumer_connection: Optional[pika.BlockingConnection] = None
         self._publisher_connection: Optional[pika.BlockingConnection] = None
@@ -144,18 +160,28 @@ class DefaultBus:
                 _Registration(exchange, routing_key, schema_name, handler)
             )
 
+    def _connection_params(
+        self, blocked_timeout: Optional[float] = None
+    ) -> pika.ConnectionParameters:
+        params = pika.URLParameters(self.amqp_url)
+        if self.heartbeat is not None:
+            params.heartbeat = self.heartbeat
+        if blocked_timeout is not None:
+            params.blocked_connection_timeout = blocked_timeout
+        return params
+
     def start(self) -> None:
         if self._started:
             return
 
         self._consumer_connection = pika.BlockingConnection(
-            pika.URLParameters(self.amqp_url)
+            self._connection_params()
         )
         self._publisher_connection = pika.BlockingConnection(
-            pika.URLParameters(self.amqp_url)
+            self._connection_params()
         )
         self._consumer_channel = self._consumer_connection.channel()
-        self._publisher_channel = self._publisher_connection.channel()
+        self._publisher_channel = self._open_publisher_channel()
 
         if self.prefetch_count:
             self._consumer_channel.basic_qos(prefetch_count=self.prefetch_count)
@@ -301,9 +327,44 @@ class DefaultBus:
             routing_key=method.routing_key or "",
         )
 
+        handler_error: List[BaseException] = []
+        handler_done = threading.Event()
+
+        def _run_handlers() -> None:
+            try:
+                for handler in handlers:
+                    handler(invocation, bus_message)
+            except Exception as e:
+                handler_error.append(e)
+            finally:
+                handler_done.set()
+
+        # ponytail: pumping process_data_events from inside a delivery callback
+        # is safe ONLY because prefetch_count=1 — the broker holds the next
+        # message while this one is unacked, so the pump can never dispatch a
+        # second delivery mid-job. With prefetch>1 the pump can re-enter this
+        # callback on the I/O thread and run handlers concurrently; revisit
+        # (serialize dispatch or move handlers onto a single worker thread).
+        with self._inflight_cond:
+            self._inflight += 1
         try:
-            for handler in handlers:
-                handler(invocation, bus_message)
+            threading.Thread(target=_run_handlers, daemon=True).start()
+            while not handler_done.wait(5):
+                if not self._started:
+                    break
+                try:
+                    self._consumer_connection.process_data_events(time_limit=0)
+                except Exception as e:
+                    logger.error("heartbeat pump error: %s", e)
+                    break
+        finally:
+            with self._inflight_cond:
+                self._inflight -= 1
+                self._inflight_cond.notify_all()
+
+        try:
+            if handler_error:
+                raise handler_error[0]
             ch.basic_ack(delivery_tag=method.delivery_tag)
         except Exception as e:
             logger.exception("handler error: %s", e)
@@ -357,8 +418,7 @@ class DefaultBus:
         request.rpc_id = rpc_id
         request.semantics = "cmd"
 
-        params = pika.URLParameters(self.amqp_url)
-        params.blocked_connection_timeout = timeout + 10
+        params = self._connection_params(blocked_timeout=timeout + 10)
         conn = pika.BlockingConnection(params)
         try:
             ch = conn.channel()
@@ -421,6 +481,13 @@ class DefaultBus:
             except Exception:
                 pass
 
+    def _open_publisher_channel(self) -> BlockingChannel:
+        channel = self._publisher_connection.channel()
+        # confirm mode makes basic_publish synchronous: it waits for the
+        # broker ack and raises UnroutableError/NackError on failure.
+        channel.confirm_delivery()
+        return channel
+
     def _ensure_publisher_channel(self) -> BlockingChannel:
         """Return an open publisher channel, reconnecting if necessary.
 
@@ -441,7 +508,7 @@ class DefaultBus:
             and self._publisher_connection.is_open
         ):
             try:
-                self._publisher_channel = self._publisher_connection.channel()
+                self._publisher_channel = self._open_publisher_channel()
                 return self._publisher_channel
             except Exception:
                 pass
@@ -455,9 +522,9 @@ class DefaultBus:
         self._publisher_connection = None
         self._publisher_channel = None
         self._publisher_connection = pika.BlockingConnection(
-            pika.URLParameters(self.amqp_url)
+            self._connection_params()
         )
-        self._publisher_channel = self._publisher_connection.channel()
+        self._publisher_channel = self._open_publisher_channel()
         logger.warning("rabbitmq publisher reconnected")
         return self._publisher_channel
 
@@ -490,17 +557,22 @@ class DefaultBus:
                 routing_key=routing_key,
                 body=body,
                 properties=properties,
+                mandatory=True,
             )
 
         with self._publisher_lock:
             try:
                 _do_publish()
             except (
-                pika.exceptions.StreamLostError,
-                pika.exceptions.ConnectionWrongStateError,
-                pika.exceptions.AMQPConnectionError,
-                pika.exceptions.ChannelWrongStateError,
+                pika.exceptions.UnroutableError,
+                pika.exceptions.NackError,
             ) as exc:
+                # broker saw the message and refused/returned it; reconnecting
+                # and republishing would fail the same way.
+                raise PublishError(
+                    f"rabbitmq publish not confirmed: {exc!r}"
+                ) from exc
+            except (TimeoutError, pika.exceptions.AMQPError) as exc:
                 logger.warning(
                     "rabbitmq publish failed (%s), reconnecting and retrying once", exc
                 )
@@ -514,16 +586,109 @@ class DefaultBus:
                     pass
                 self._publisher_connection = None
                 self._publisher_channel = None
-                _do_publish()
+                try:
+                    _do_publish()
+                except Exception as retry_exc:
+                    raise PublishError(
+                        f"rabbitmq publish failed after reconnect: {retry_exc!r}"
+                    ) from retry_exc
 
-    def shutdown(self) -> None:
+    def health(self) -> bool:
+        """True when the bus is started and both connections and the
+        consumer thread are alive."""
+        return (
+            self._started
+            and self._consumer_connection is not None
+            and self._consumer_connection.is_open
+            and self._publisher_connection is not None
+            and self._publisher_connection.is_open
+            and self._io_thread is not None
+            and self._io_thread.is_alive()
+        )
+
+    def _management_channel(self) -> BlockingChannel:
+        """Publisher channel for management ops. Caller must hold
+        _publisher_lock; only the publisher connection is safe to touch from
+        non-I/O threads (the consumer connection is owned by the I/O thread).
+        A dead channel (e.g. passive declare miss) is discarded so the next
+        call/publish recreates it."""
+        if not self._started:
+            raise RuntimeError("bus not started")
+        return self._ensure_publisher_channel()
+
+    def queue_depth(self, name: str) -> int:
+        """Depth of a queue via passive declare; 0 when the queue is absent."""
+        with self._publisher_lock:
+            ch = self._management_channel()
+            try:
+                return ch.queue_declare(
+                    queue=name, passive=True
+                ).method.message_count
+            except pika.exceptions.ChannelClosedByBroker:
+                return 0
+            finally:
+                if not ch.is_open:
+                    self._publisher_channel = None
+
+    def purge(self, name: str) -> int:
+        """Purge a queue; returns the number of messages removed (0 when the
+        queue is absent)."""
+        with self._publisher_lock:
+            ch = self._management_channel()
+            try:
+                return ch.queue_purge(queue=name).method.message_count
+            except pika.exceptions.ChannelClosedByBroker:
+                return 0
+            finally:
+                if not ch.is_open:
+                    self._publisher_channel = None
+
+    def deadletter_count(self) -> int:
+        """Depth of the DLX parking queue, 0 when deadlettering is not
+        configured or the parking queue does not exist."""
+        if not self.dlx:
+            return 0
+        # ponytail: assumes a parking queue named "<dlx>.parking"; this bus
+        # binds the DLX back onto the service queue for redelivery, so there
+        # is no parking queue to count unless the operator created one.
+        return self.queue_depth(f"{self.dlx}.parking")
+
+    def shutdown(self, drain: bool = False, drain_timeout: float = 30.0) -> None:
+        """Stop consuming and close connections.
+
+        With drain=True, cancel the consumers first and let the in-flight
+        handler finish (bounded by drain_timeout) so its message is acked
+        cleanly instead of being requeued by the broker.
+        """
+        if drain:
+            try:
+                if self._consumer_channel and self._consumer_channel.is_open:
+                    for tag in (self._service_consumer_tag, self._rpc_consumer_tag):
+                        if tag:
+                            self._consumer_channel.basic_cancel(tag)
+            except Exception:
+                pass
+            deadline = time.time() + drain_timeout
+            with self._inflight_cond:
+                while self._inflight > 0 and time.time() < deadline:
+                    self._inflight_cond.wait(timeout=0.5)
+
         self._started = False
         if self._consumer_channel and self._consumer_channel.is_open:
             try:
                 self._consumer_channel.stop_consuming()
             except Exception:
                 pass
+        if self._io_thread is not None:
+            self._io_thread.join(timeout=5)
+            self._io_thread = None
         if self._consumer_connection and self._consumer_connection.is_open:
-            self._consumer_connection.close()
+            try:
+                self._consumer_connection.close()
+            except Exception:
+                pass
         if self._publisher_connection and self._publisher_connection.is_open:
-            self._publisher_connection.close()
+            try:
+                self._publisher_connection.close()
+            except Exception:
+                pass
