@@ -14,9 +14,15 @@ class Builder:
         self._prefetch_count: int = 1
         self._purge_on_startup: bool = False
         self._dlx: Optional[str] = None
+        self._heartbeat: Optional[int] = 30
 
     def bus(self, amqp_url: str) -> "Builder":
         self._amqp_url = amqp_url
+        return self
+
+    def heartbeat(self, seconds: Optional[int]) -> "Builder":
+        """Heartbeat interval for both connections; None keeps the URL value."""
+        self._heartbeat = seconds
         return self
 
     def with_policies(self, *policies: MessagePolicy) -> "Builder":
@@ -52,6 +58,7 @@ class Builder:
             prefetch_count=self._prefetch_count,
             purge_on_startup=self._purge_on_startup,
             dlx=self._dlx,
+            heartbeat=self._heartbeat,
         )
 
 
