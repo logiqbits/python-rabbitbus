@@ -174,14 +174,25 @@ class DefaultBus:
         if self._started:
             return
 
-        self._consumer_connection = pika.BlockingConnection(
-            self._connection_params()
-        )
+        self._connect_consumer()
         self._publisher_connection = pika.BlockingConnection(
             self._connection_params()
         )
-        self._consumer_channel = self._consumer_connection.channel()
         self._publisher_channel = self._open_publisher_channel()
+
+        self._started = True
+        self._start_consuming()
+
+    def _connect_consumer(self) -> None:
+        """(Re)open the consumer connection/channel and attach consumers.
+
+        Runs on the I/O thread only: start() calls it before spawning that
+        thread, and the reconnect loop in _consume_loop calls it after a drop.
+        """
+        self._consumer_connection = pika.BlockingConnection(
+            self._connection_params()
+        )
+        self._consumer_channel = self._consumer_connection.channel()
 
         if self.prefetch_count:
             self._consumer_channel.basic_qos(prefetch_count=self.prefetch_count)
@@ -190,13 +201,29 @@ class DefaultBus:
         self._declare_and_bind_service_queue()
         self._rpc_queue = self._declare_rpc_queue()
 
-        self._started = True
-
         # bind delayed subscriptions now that the channel exists
         for exchange, topic in self._delayed_subscriptions:
             self._bind_queue(topic, exchange)
 
-        self._start_consuming()
+        self._service_consumer_tag = self._consumer_channel.basic_consume(
+            queue=self._service_queue,
+            on_message_callback=self._on_service_message,
+            auto_ack=False,
+        )
+        self._rpc_consumer_tag = self._consumer_channel.basic_consume(
+            queue=self._rpc_queue,
+            on_message_callback=self._on_rpc_message,
+            auto_ack=False,
+        )
+
+    def _close_consumer(self) -> None:
+        """Best-effort teardown of a dead consumer connection (I/O thread only)."""
+        for closer in (self._consumer_channel, self._consumer_connection):
+            if closer is not None:
+                try:
+                    closer.close()
+                except Exception:
+                    pass
 
     def _declare_service_queue(self) -> str:
         args = {}
@@ -245,29 +272,48 @@ class DefaultBus:
         )
 
     def _start_consuming(self) -> None:
-        self._service_consumer_tag = self._consumer_channel.basic_consume(
-            queue=self._service_queue,
-            on_message_callback=self._on_service_message,
-            auto_ack=False,
-        )
-        self._rpc_consumer_tag = self._consumer_channel.basic_consume(
-            queue=self._rpc_queue,
-            on_message_callback=self._on_rpc_message,
-            auto_ack=False,
-        )
-
         # run I/O loop in a background thread so callers can keep working
         self._io_thread = threading.Thread(target=self._consume_loop, daemon=True)
         self._io_thread.start()
 
     def _consume_loop(self) -> None:
-        while self._started and self._consumer_channel and self._consumer_channel.is_open:
+        """Pump deliveries; on connection loss reconnect with backoff.
+
+        I/O-thread only (the consumer connection is owned by this thread; see
+        _management_channel). Messages unacked at drop time are requeued by the
+        broker and redelivered after reconnect — handlers must tolerate
+        at-least-once delivery.
+        """
+        backoff = 1.0
+        while self._started:
+            if self._io_thread is not threading.current_thread():
+                break  # superseded: shutdown cleared it or start() spawned a newer one
             try:
                 self._consumer_connection.process_data_events(time_limit=None)
             except Exception as e:
-                if self._started:
-                    logger.error("consumer loop error: %s", e)
+                if not self._started:
+                    break
+                logger.error(
+                    "consumer connection lost (%s); reconnecting in %.1fs", e, backoff
+                )
+            else:
+                if not self._started:
+                    break
+                logger.error(
+                    "consumer loop ended unexpectedly; reconnecting in %.1fs", backoff
+                )
+            with self._inflight_cond:
+                self._inflight_cond.wait(timeout=backoff)
+            if not self._started:
                 break
+            try:
+                self._close_consumer()
+                self._connect_consumer()
+            except Exception as e:
+                logger.error("consumer reconnect failed: %s", e)
+                backoff = min(backoff * 2, 30.0)
+            else:
+                backoff = 1.0
 
     def _on_service_message(
         self,
@@ -368,7 +414,10 @@ class DefaultBus:
             ch.basic_ack(delivery_tag=method.delivery_tag)
         except Exception as e:
             logger.exception("handler error: %s", e)
-            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            try:
+                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            except Exception:
+                pass  # dead channel: the consume loop treats this as a reconnect
 
     def _extract_bus_message(
         self,
@@ -674,6 +723,8 @@ class DefaultBus:
                     self._inflight_cond.wait(timeout=0.5)
 
         self._started = False
+        with self._inflight_cond:
+            self._inflight_cond.notify_all()  # wake a sleeping reconnect backoff
         if self._consumer_channel and self._consumer_channel.is_open:
             try:
                 self._consumer_channel.stop_consuming()

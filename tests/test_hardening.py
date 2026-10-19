@@ -123,6 +123,44 @@ def test_heartbeat_pump():
     print("PASS heartbeat pump: connection survives 3x-heartbeat handler block")
 
 
+def test_consumer_reconnect():
+    """Consumer connection drop must not kill the bus: the I/O thread reconnects,
+    re-attaches to the durable service queue, and keeps receiving."""
+    got = []
+    alive = threading.Event()
+
+    def handler(invocation, message):
+        got.append(message.payload.data)
+        alive.set()
+
+    recv = make_bus(SVC_RECV)
+    recv.handle_message(TMsg, handler)
+    recv.start()
+    send = make_bus(SVC_SEND)
+    send.register_message_type(TMsg)
+    send.start()
+    try:
+        send.send(SVC_RECV, BusMessage(TMsg(data="before")))
+        assert alive.wait(timeout=15), "first message must be received"
+        alive.clear()
+
+        old_conn = recv._consumer_connection
+        old_conn.close()  # same trick as test_retry_reconnect for the publisher
+        deadline = time.time() + 15
+        while recv._consumer_connection is old_conn and time.time() < deadline:
+            time.sleep(0.2)
+        assert recv._consumer_connection is not old_conn, "consumer must reconnect"
+
+        send.send(SVC_RECV, BusMessage(TMsg(data="after")))
+        assert alive.wait(timeout=15), "message after drop must be received"
+        assert got == ["before", "after"], f"no duplicates/losses: {got}"
+        assert recv.health(), "bus must report healthy after consumer reconnect"
+    finally:
+        send.shutdown()
+        recv.shutdown(drain=True)
+    print("PASS consumer reconnect: bus survives a dead consumer connection")
+
+
 def test_queue_depth_and_purge(bus, raw_ch):
     raw_ch.queue_declare(queue=PURGE_QUEUE, durable=False, auto_delete=True)
     for i in range(3):
@@ -149,6 +187,7 @@ def main():
         test_retry_reconnect(bus)
         test_queue_depth_and_purge(bus, raw_ch)
         test_heartbeat_pump()
+        test_consumer_reconnect()
 
         assert bus.deadletter_count() == 0, "no dlx configured -> 0"
         print("PASS deadletter_count() == 0 without dlx")
