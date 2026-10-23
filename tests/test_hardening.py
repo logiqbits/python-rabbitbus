@@ -91,7 +91,7 @@ def test_retry_reconnect(bus):
     print("PASS retry path: dead channel/connection reconnects, failures raise")
 
 
-def test_heartbeat_pump():
+def test_heartbeat_pump(_needs_broker):
     done = threading.Event()
     started_at = time.time()
 
@@ -123,7 +123,7 @@ def test_heartbeat_pump():
     print("PASS heartbeat pump: connection survives 3x-heartbeat handler block")
 
 
-def test_consumer_reconnect():
+def test_consumer_reconnect(_needs_broker):
     """Consumer connection drop must not kill the bus: the I/O thread reconnects,
     re-attaches to the durable service queue, and keeps receiving."""
     got = []
@@ -211,3 +211,169 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- pytest-only section: fixtures for the broker tests above + unit tests ---
+
+import ssl  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+import pytest  # noqa: E402
+
+import rabbitbus.bus as bus_mod  # noqa: E402
+from rabbitbus.bus import DefaultBus  # noqa: E402
+
+UNIT_URL = "amqp://guest:guest@localhost:5672/%2f"
+
+
+def _broker_available() -> bool:
+    try:
+        params = pika.URLParameters(AMQP_URL)
+        params.socket_timeout = 2
+        conn = pika.BlockingConnection(params)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture
+def _needs_broker():
+    if not _broker_available():
+        pytest.skip("no live RabbitMQ broker")
+
+
+@pytest.fixture
+def raw_ch():
+    if not _broker_available():
+        pytest.skip("no live RabbitMQ broker")
+    conn = pika.BlockingConnection(pika.URLParameters(AMQP_URL))
+    ch = conn.channel()
+    yield ch
+    conn.close()
+
+
+@pytest.fixture
+def bus():
+    if not _broker_available():
+        pytest.skip("no live RabbitMQ broker")
+    b = make_bus(SVC_PUB)
+    b.start()
+    yield b
+    b.shutdown(drain=True)
+
+
+class _FakeTime:
+    """Stubs sleep (backoff would otherwise take minutes); real time()."""
+
+    def __init__(self):
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+    def time(self):
+        return time.time()
+
+
+def test_connection_params_blocked_timeout_default_and_override():
+    bus = DefaultBus(UNIT_URL, "svc")
+    assert bus._connection_params().blocked_connection_timeout == 300.0
+    assert bus._connection_params(None).blocked_connection_timeout == 300.0
+    assert bus._connection_params(12.0).blocked_connection_timeout == 12.0
+    # rpc() passes timeout + 10 explicitly; that override must win
+    assert bus._connection_params(15.0).blocked_connection_timeout == 15.0
+    no_block = DefaultBus(UNIT_URL, "svc", blocked_timeout=None)
+    assert no_block._connection_params().blocked_connection_timeout is None
+
+
+def test_start_retries_then_succeeds(monkeypatch):
+    fake_time = _FakeTime()
+    monkeypatch.setattr(bus_mod, "time", fake_time)
+    calls = {"n": 0}
+    conn = MagicMock()
+
+    def flaky_connect(params):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise pika.exceptions.AMQPConnectionError("broker down")
+        return conn
+
+    monkeypatch.setattr(bus_mod.pika, "BlockingConnection", flaky_connect)
+    bus = DefaultBus(UNIT_URL, "svc")
+    try:
+        bus.start()
+        assert calls["n"] >= 3  # 2 failures then success; the I/O loop may add more
+        assert bus._started
+        # consumer + publisher got their blocked/unblocked callbacks
+        assert conn.add_on_connection_blocked_callback.call_count >= 2
+        assert conn.add_on_connection_unblocked_callback.call_count >= 2
+    finally:
+        bus.shutdown()
+
+
+def test_start_retry_bounded_exhaustion(monkeypatch):
+    fake_time = _FakeTime()
+    monkeypatch.setattr(bus_mod, "time", fake_time)
+    attempts = {"n": 0}
+
+    def always_fail(params):
+        attempts["n"] += 1
+        raise pika.exceptions.AMQPConnectionError("broker down")
+
+    monkeypatch.setattr(bus_mod.pika, "BlockingConnection", always_fail)
+    bus = DefaultBus(UNIT_URL, "svc")
+    with pytest.raises(pika.exceptions.AMQPConnectionError):
+        bus.start()
+    assert attempts["n"] == 10  # bounded: not an infinite retry
+    assert not bus._started
+
+
+def test_builder_tls_sets_ssl_options_and_amqps(monkeypatch, tmp_path):
+    # stub the file-loading calls; we only assert the wiring, not real certs
+    monkeypatch.setattr(
+        ssl.SSLContext, "load_verify_locations", lambda self, f: None
+    )
+    monkeypatch.setattr(
+        ssl.SSLContext, "load_cert_chain", lambda self, cf, kf=None: None
+    )
+    bus = (
+        builder()
+        .bus("amqp://user:pass@rmq.internal:5672/vhost")
+        .tls(
+            ca_certs=str(tmp_path / "ca.pem"),
+            certfile=str(tmp_path / "client.pem"),
+            keyfile=str(tmp_path / "client.key"),
+            server_hostname="rmq.internal",
+        )
+        .build("svc")
+    )
+    assert bus.amqp_url.startswith("amqps://")
+    params = bus._connection_params()
+    assert isinstance(params.ssl_options, pika.SSLOptions)
+    assert params.ssl_options.server_hostname == "rmq.internal"
+
+
+def test_builder_tls_before_bus_still_amqps(monkeypatch):
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", lambda self, f: None)
+    bus = builder().tls(ca_certs="/ca.pem").bus(UNIT_URL).build("svc")
+    assert bus.amqp_url.startswith("amqps://")
+
+
+def test_builder_no_tls_untouched():
+    bus = builder().bus(UNIT_URL).build("svc")
+    assert bus.amqp_url == UNIT_URL
+    assert bus._connection_params().ssl_options is None
+
+
+def test_builder_blocked_timeout():
+    bus = builder().bus(UNIT_URL).blocked_timeout(7).build("svc")
+    assert bus._connection_params().blocked_connection_timeout == 7
+
+
+def test_attach_blocked_callbacks_registers_both():
+    bus = DefaultBus(UNIT_URL, "svc")
+    conn = MagicMock()
+    bus._attach_blocked_callbacks(conn)
+    conn.add_on_connection_blocked_callback.assert_called_once()
+    conn.add_on_connection_unblocked_callback.assert_called_once()

@@ -1,4 +1,5 @@
 import logging
+import ssl
 import threading
 import time
 import uuid
@@ -90,6 +91,11 @@ class DefaultBus:
         purge_on_startup: bool = False,
         dlx: Optional[str] = None,
         heartbeat: Optional[int] = 30,
+        blocked_timeout: Optional[float] = 300.0,
+        ca_certs: Optional[str] = None,
+        certfile: Optional[str] = None,
+        keyfile: Optional[str] = None,
+        server_hostname: Optional[str] = None,
     ):
         self.amqp_url = amqp_url
         self.svc_name = svc_name
@@ -102,6 +108,12 @@ class DefaultBus:
         # None keeps the URL value; an int is applied to every connection the
         # bus opens so the URL can no longer silently disable heartbeats.
         self.heartbeat = heartbeat
+        # None disables: broker flow-control then stalls a connection silently.
+        self.blocked_timeout = blocked_timeout
+        self.ca_certs = ca_certs
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.server_hostname = server_hostname
 
         self._started = False
         self._handlers_lock = threading.Lock()
@@ -166,19 +178,68 @@ class DefaultBus:
         params = pika.URLParameters(self.amqp_url)
         if self.heartbeat is not None:
             params.heartbeat = self.heartbeat
+        if blocked_timeout is None:
+            blocked_timeout = self.blocked_timeout
         if blocked_timeout is not None:
             params.blocked_connection_timeout = blocked_timeout
+        if self.ca_certs or self.certfile:
+            # overrides pika's default amqps context so the client cert is sent
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if self.ca_certs:
+                context.load_verify_locations(self.ca_certs)
+            if self.certfile:
+                context.load_cert_chain(self.certfile, self.keyfile)
+            params.ssl_options = pika.SSLOptions(context, self.server_hostname)
         return params
+
+    def _attach_blocked_callbacks(self, conn: pika.BlockingConnection) -> None:
+        def _on_blocked(_conn, method) -> None:
+            logger.warning("rabbitmq connection blocked by broker: %s", method.reason)
+
+        def _on_unblocked(_conn, method) -> None:
+            logger.info("rabbitmq connection unblocked: %s", method.reason)
+
+        conn.add_on_connection_blocked_callback(_on_blocked)
+        conn.add_on_connection_unblocked_callback(_on_unblocked)
+
+    def _connect_with_retry(self, connect: Callable[[], None]) -> None:
+        """Run connect() with bounded backoff so a down broker at boot is
+        retried (max 10 attempts, capped 30s) instead of crashing the host."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(10):
+            try:
+                connect()
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "rabbitmq connect attempt %d/10 failed: %s", attempt + 1, e
+                )
+                self._close_consumer()  # drop any half-open connection
+                if self._publisher_connection is not None:
+                    try:
+                        self._publisher_connection.close()
+                    except Exception:
+                        pass
+                    self._publisher_connection = None
+                    self._publisher_channel = None
+                if attempt < 9:
+                    time.sleep(min(2 ** attempt, 30))
+        raise last_exc  # type: ignore[misc]
 
     def start(self) -> None:
         if self._started:
             return
 
-        self._connect_consumer()
-        self._publisher_connection = pika.BlockingConnection(
-            self._connection_params()
-        )
-        self._publisher_channel = self._open_publisher_channel()
+        def _connect_all() -> None:
+            self._connect_consumer()
+            self._publisher_connection = pika.BlockingConnection(
+                self._connection_params()
+            )
+            self._attach_blocked_callbacks(self._publisher_connection)
+            self._publisher_channel = self._open_publisher_channel()
+
+        self._connect_with_retry(_connect_all)
 
         self._started = True
         self._start_consuming()
@@ -192,6 +253,7 @@ class DefaultBus:
         self._consumer_connection = pika.BlockingConnection(
             self._connection_params()
         )
+        self._attach_blocked_callbacks(self._consumer_connection)
         self._consumer_channel = self._consumer_connection.channel()
 
         if self.prefetch_count:
@@ -573,6 +635,7 @@ class DefaultBus:
         self._publisher_connection = pika.BlockingConnection(
             self._connection_params()
         )
+        self._attach_blocked_callbacks(self._publisher_connection)
         self._publisher_channel = self._open_publisher_channel()
         logger.warning("rabbitmq publisher reconnected")
         return self._publisher_channel

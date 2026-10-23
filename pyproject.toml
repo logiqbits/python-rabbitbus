@@ -1,6 +1,6 @@
 [project]
 name = "logiqbits-rabbitbus"
-version = "0.3.1"
+version = "0.3.2"
 description = "RabbitMQ service bus for Python, compatible with go-rabbitbus"
 readme = "README.md"
 license = "Apache-2.0"

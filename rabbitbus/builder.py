@@ -1,8 +1,16 @@
 from typing import List, Optional
+from urllib.parse import urlparse, urlunparse
 
 from .bus import DefaultBus
 from .policies import MessagePolicy
 from .serialization import JsonSerializer, Serializer
+
+
+def _amqps(url: str) -> str:
+    parts = urlparse(url)
+    if parts.scheme == "amqps":
+        return url
+    return urlunparse(parts._replace(scheme="amqps"))
 
 
 class Builder:
@@ -15,14 +23,49 @@ class Builder:
         self._purge_on_startup: bool = False
         self._dlx: Optional[str] = None
         self._heartbeat: Optional[int] = 30
+        self._blocked_timeout: Optional[float] = 300.0
+        self._ca_certs: Optional[str] = None
+        self._certfile: Optional[str] = None
+        self._keyfile: Optional[str] = None
+        self._server_hostname: Optional[str] = None
 
     def bus(self, amqp_url: str) -> "Builder":
-        self._amqp_url = amqp_url
+        self._amqp_url = _amqps(amqp_url) if self._tls_enabled() else amqp_url
         return self
+
+    def _tls_enabled(self) -> bool:
+        return bool(
+            self._ca_certs or self._certfile or self._keyfile or self._server_hostname
+        )
 
     def heartbeat(self, seconds: Optional[int]) -> "Builder":
         """Heartbeat interval for both connections; None keeps the URL value."""
         self._heartbeat = seconds
+        return self
+
+    def blocked_timeout(self, seconds: Optional[float]) -> "Builder":
+        """Blocked-connection timeout for both connections; None disables."""
+        self._blocked_timeout = seconds
+        return self
+
+    def tls(
+        self,
+        ca_certs: Optional[str] = None,
+        certfile: Optional[str] = None,
+        keyfile: Optional[str] = None,
+        server_hostname: Optional[str] = None,
+    ) -> "Builder":
+        """Enable TLS with optional custom CA and client certificate.
+
+        Rewrites the URL scheme to amqps so a plain amqp:// URL cannot
+        silently downgrade the connection.
+        """
+        self._ca_certs = ca_certs
+        self._certfile = certfile
+        self._keyfile = keyfile
+        self._server_hostname = server_hostname
+        if self._amqp_url:
+            self._amqp_url = _amqps(self._amqp_url)
         return self
 
     def with_policies(self, *policies: MessagePolicy) -> "Builder":
@@ -59,6 +102,11 @@ class Builder:
             purge_on_startup=self._purge_on_startup,
             dlx=self._dlx,
             heartbeat=self._heartbeat,
+            blocked_timeout=self._blocked_timeout,
+            ca_certs=self._ca_certs,
+            certfile=self._certfile,
+            keyfile=self._keyfile,
+            server_hostname=self._server_hostname,
         )
 
 
