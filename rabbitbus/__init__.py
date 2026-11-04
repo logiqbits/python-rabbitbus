@@ -1,5 +1,5 @@
 from .builder import Builder
-from .bus import DefaultBus, PublishError
+from .bus import DefaultBus, PublishError, retry_exchange_name
 from .invocation import Invocation
 from .messages import BusMessage, Message
 from .policies import Durable, NonDurable
@@ -16,6 +16,7 @@ __all__ = [
     "Builder",
     "DefaultBus",
     "PublishError",
+    "retry_exchange_name",
     "Invocation",
     "BusMessage",
     "Message",

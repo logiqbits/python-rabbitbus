@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[Invocation, BusMessage], Any]
 
+DeadletterCallback = Callable[[Dict[str, Any], bytes], None]
+
+
+def retry_exchange_name(name: str) -> str:
+    """Retry exchange for a service (``<name>.retry``): handlers republish
+    transient failures here to get a delayed redelivery via the retry
+    queues declared by with_delayed_retry."""
+    return f"{name}.retry"
+
 
 class PublishError(Exception):
     """A message was not confirmed as delivered by the broker.
@@ -96,6 +105,8 @@ class DefaultBus:
         certfile: Optional[str] = None,
         keyfile: Optional[str] = None,
         server_hostname: Optional[str] = None,
+        max_attempts: int = 0,
+        retry_delays: Optional[List[float]] = None,
     ):
         self.amqp_url = amqp_url
         self.svc_name = svc_name
@@ -114,6 +125,10 @@ class DefaultBus:
         self.certfile = certfile
         self.keyfile = keyfile
         self.server_hostname = server_hostname
+        # 0 = unlimited deadletter attempts
+        self.max_attempts = max_attempts
+        self.retry_delays = retry_delays or []
+        self._deadletter_callback: Optional[DeadletterCallback] = None
 
         self._started = False
         self._handlers_lock = threading.Lock()
@@ -159,6 +174,14 @@ class DefaultBus:
         else:
             self._bind_queue(topic, exchange)
         self._register(schema_name, exchange, topic, handler)
+
+    def on_deadletter(self, callback: DeadletterCallback) -> None:
+        """Register a callback for poison messages: deliveries that come back
+        through the DLX after the service queue rejected them. Receives
+        (delivery_info, body) where delivery_info carries exchange,
+        routing_key and headers (including x-death) so the app can persist
+        the poison message. Parity with the Go RegisterDeadletterHandler."""
+        self._deadletter_callback = callback
 
     def _register(
         self,
@@ -261,6 +284,7 @@ class DefaultBus:
 
         self._service_queue = self._declare_service_queue()
         self._declare_and_bind_service_queue()
+        self._declare_retry_infrastructure()
         self._rpc_queue = self._declare_rpc_queue()
 
         # bind delayed subscriptions now that the channel exists
@@ -314,6 +338,32 @@ class DefaultBus:
             )
             self._consumer_channel.queue_bind(
                 queue=self._service_queue, exchange=self.dlx, routing_key=""
+            )
+
+    def _declare_retry_infrastructure(self) -> None:
+        """One TTL queue per delay, bound to the fanout retry exchange; on
+        expiry messages are dead-lettered back onto the service queue (via the
+        default exchange) for a normal-handler redelivery. Their x-death names
+        the retry queue, so they are NOT poison to _is_deadletter_redelivery."""
+        if not self.retry_delays:
+            return
+        retry_ex = retry_exchange_name(self.svc_name)
+        self._consumer_channel.exchange_declare(
+            exchange=retry_ex, exchange_type="fanout", durable=True
+        )
+        for delay in self.retry_delays:
+            queue = f"{self.svc_name}.retry.{delay}s"
+            self._consumer_channel.queue_declare(
+                queue=queue,
+                durable=True,
+                arguments={
+                    "x-message-ttl": int(delay * 1000),
+                    "x-dead-letter-exchange": "",
+                    "x-dead-letter-routing-key": self.svc_name,
+                },
+            )
+            self._consumer_channel.queue_bind(
+                queue=queue, exchange=retry_ex, routing_key=""
             )
 
     def _declare_rpc_queue(self) -> str:
@@ -419,6 +469,10 @@ class DefaultBus:
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
+        if self._is_deadletter_redelivery(method, properties):
+            self._handle_deadletter(ch, method, properties, body)
+            return
+
         handlers = self._resolve_handlers(
             method.exchange, method.routing_key, bus_message.payload_fqn
         )
@@ -480,6 +534,69 @@ class DefaultBus:
                 ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
             except Exception:
                 pass  # dead channel: the consume loop treats this as a reconnect
+
+    def _is_deadletter_redelivery(
+        self, method: pika.frame.Method, properties: pika.BasicProperties
+    ) -> bool:
+        """True when the delivery came back through our DLX from the service
+        queue itself — i.e. the service queue rejected it (poison). Messages
+        dead-lettered from the retry queues arrive at the default exchange
+        with a foreign-queue x-death and must fall through to handlers."""
+        if not self.dlx or method.exchange != self.dlx:
+            return False
+        x_death = (properties.headers or {}).get("x-death") or []
+        # x-death is ordered most-recent-first
+        return bool(x_death) and x_death[0].get("queue") == self.svc_name
+
+    def _handle_deadletter(
+        self,
+        ch: BlockingChannel,
+        method: pika.frame.Method,
+        properties: pika.BasicProperties,
+        body: bytes,
+    ) -> None:
+        x_death = (properties.headers or {}).get("x-death") or []
+        death_count = x_death[0].get("count", 1)
+        if self.max_attempts and death_count >= self.max_attempts:
+            logger.error(
+                "message %s rejected %d times (>= max_attempts=%d); parked, "
+                "operator intervention needed",
+                properties.message_id, death_count, self.max_attempts,
+            )
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        callback = self._deadletter_callback
+        if callback is None:
+            logger.warning(
+                "dead-lettered message %s but no deadletter callback "
+                "registered; rejecting (requeue=False)",
+                properties.message_id,
+            )
+            try:
+                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            except Exception:
+                pass  # dead channel: the consume loop treats this as a reconnect
+            return
+
+        delivery_info = {
+            "exchange": method.exchange,
+            "routing_key": method.routing_key,
+            "headers": properties.headers or {},
+        }
+        try:
+            # ponytail: callback runs inline on the I/O thread, so a slow
+            # callback stalls the heartbeat pump; upgrade by dispatching it
+            # through the same worker-thread machinery as normal handlers.
+            callback(delivery_info, body)
+        except Exception as e:
+            logger.exception("deadletter callback error: %s", e)
+            try:
+                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            except Exception:
+                pass  # dead channel: the consume loop treats this as a reconnect
+            return
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _extract_bus_message(
         self,

@@ -22,6 +22,8 @@ class Builder:
         self._prefetch_count: int = 1
         self._purge_on_startup: bool = False
         self._dlx: Optional[str] = None
+        self._max_attempts: int = 0
+        self._retry_delays: List[float] = []
         self._heartbeat: Optional[int] = 30
         self._blocked_timeout: Optional[float] = 300.0
         self._ca_certs: Optional[str] = None
@@ -89,6 +91,21 @@ class Builder:
         self._dlx = deadletter_exchange
         return self
 
+    def with_deadletter_retries(self, max_attempts: int = 3) -> "Builder":
+        """Cap deadletter redeliveries: once the x-death count for the service
+        queue reaches max_attempts the message is acked and parked (logged as
+        needing operator intervention) instead of invoking the deadletter
+        callback again."""
+        self._max_attempts = max_attempts
+        return self
+
+    def with_delayed_retry(self, delays: List[float]) -> "Builder":
+        """Declare one TTL retry queue per delay (seconds) on the fanout
+        retry exchange <svc>.retry; handlers republish transient failures
+        there via invocation.publish for a delayed redelivery."""
+        self._retry_delays = list(delays)
+        return self
+
     def build(self, svc_name: str) -> DefaultBus:
         if not self._amqp_url:
             raise ValueError("amqp_url is required")
@@ -107,6 +124,8 @@ class Builder:
             certfile=self._certfile,
             keyfile=self._keyfile,
             server_hostname=self._server_hostname,
+            max_attempts=self._max_attempts,
+            retry_delays=self._retry_delays,
         )
 
 

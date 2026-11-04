@@ -1,13 +1,17 @@
-"""Hardening checks for python-rabbitbus 0.3.0 against a live broker.
+"""Hardening checks for python-rabbitbus against a live broker.
 
 Plain assert-based script (no pytest), same convention as e2e_python.py.
 Run from the repo root:
 
     PYTHONPATH=. python tests/test_hardening.py
 
-Uses uniquely-named rbtest_* queues/exchanges and cleans them up in finally.
+Broker via RABBITBUS_AMQP (default amqp://guest:guest@localhost), same
+convention as the Go twin. Uses uniquely-named rbtest_* queues/exchanges and
+cleans them up in finally.
 """
 
+import json
+import os
 import sys
 import threading
 import time
@@ -18,9 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pika
 
-from rabbitbus import builder, BusMessage, Message, PublishError
+from rabbitbus import builder, BusMessage, Message, PublishError, retry_exchange_name
 
-AMQP_URL = "amqp://user:Password%402026@119.40.87.181:5672"
+AMQP_URL = os.environ.get("RABBITBUS_AMQP", "amqp://guest:guest@localhost")
 
 SUFFIX = uuid.uuid4().hex[:8]
 EXCHANGE = f"rbtest_ex_{SUFFIX}"
@@ -29,6 +33,9 @@ PURGE_QUEUE = f"rbtest_purge_{SUFFIX}"
 SVC_PUB = f"rbtest_pub_{SUFFIX}"
 SVC_RECV = f"rbtest_recv_{SUFFIX}"
 SVC_SEND = f"rbtest_send_{SUFFIX}"
+SVC_DL = f"rbtest_svc_dl_{SUFFIX}"
+DLX = f"rbtest_dlx_{SUFFIX}"
+RETRY_EX = retry_exchange_name(SVC_DL)
 
 
 class TMsg(Message):
@@ -41,6 +48,15 @@ class TMsg(Message):
 
 def make_bus(svc_name, heartbeat=30):
     return builder().bus(AMQP_URL).heartbeat(heartbeat).build(svc_name)
+
+
+def make_dl_bus(svc_name, max_attempts=0, delays=None, dlx=DLX):
+    b = builder().bus(AMQP_URL).with_deadlettering(dlx)
+    if max_attempts:
+        b = b.with_deadletter_retries(max_attempts)
+    if delays:
+        b = b.with_delayed_retry(delays)
+    return b.build(svc_name)
 
 
 def test_publish_confirm_and_unroutable(bus, raw_ch):
@@ -91,7 +107,7 @@ def test_retry_reconnect(bus):
     print("PASS retry path: dead channel/connection reconnects, failures raise")
 
 
-def test_heartbeat_pump(_needs_broker):
+def test_heartbeat_pump(_needs_broker=None):
     done = threading.Event()
     started_at = time.time()
 
@@ -123,7 +139,7 @@ def test_heartbeat_pump(_needs_broker):
     print("PASS heartbeat pump: connection survives 3x-heartbeat handler block")
 
 
-def test_consumer_reconnect(_needs_broker):
+def test_consumer_reconnect(_needs_broker=None):
     """Consumer connection drop must not kill the bus: the I/O thread reconnects,
     re-attaches to the durable service queue, and keeps receiving."""
     got = []
@@ -175,6 +191,177 @@ def test_queue_depth_and_purge(bus, raw_ch):
     print("PASS queue_depth/purge round-trip")
 
 
+def test_deadletter_callback_once_no_loop():
+    """Handler error -> DLX -> poison detected -> deadletter callback exactly
+    once, acked; the old code re-ran the handler at full speed forever."""
+    handler_calls = []
+    dl_calls = []
+    got_dl = threading.Event()
+
+    def handler(invocation, message):
+        handler_calls.append(message.payload.data)
+        raise RuntimeError("boom")
+
+    def on_deadletter(delivery_info, body):
+        dl_calls.append(delivery_info)
+        got_dl.set()
+
+    recv = make_dl_bus(SVC_DL)
+    recv.handle_message(TMsg, handler)
+    recv.on_deadletter(on_deadletter)
+    recv.start()
+    send = make_bus(SVC_SEND)
+    send.register_message_type(TMsg)
+    send.start()
+    try:
+        send.send(SVC_DL, BusMessage(TMsg(data="poison")))
+        assert got_dl.wait(timeout=15), "deadletter callback must be invoked"
+        time.sleep(3)  # long enough for the old infinite loop to explode
+        assert len(dl_calls) == 1, f"callback must fire exactly once: {len(dl_calls)}"
+        assert len(handler_calls) == 1, "poison must not reach handlers again"
+        info = dl_calls[0]
+        assert info["exchange"] == DLX, "delivery_info carries the DLX exchange"
+        assert info["routing_key"] == SVC_DL
+        assert "x-death" in info["headers"], "delivery_info carries x-death"
+        assert info["headers"]["x-death"][0]["queue"] == SVC_DL
+        deadline = time.time() + 10
+        while recv.queue_depth(SVC_DL) != 0 and time.time() < deadline:
+            time.sleep(0.2)
+        assert recv.queue_depth(SVC_DL) == 0, "acked poison must drain"
+    finally:
+        send.shutdown()
+        recv.shutdown(drain=True)
+    print("PASS deadletter: poison routed to callback once, acked, no loop")
+
+
+def test_deadletter_max_attempts_parks():
+    """max_attempts=2: callback fails once -> count reaches 2 -> parked:
+    acked, no further callback invocations, no reject re-loop."""
+    dl_calls = []
+    parked = threading.Event()
+
+    def handler(invocation, message):
+        raise RuntimeError("boom")
+
+    def on_deadletter(delivery_info, body):
+        dl_calls.append(1)
+        raise RuntimeError("cannot persist")
+
+    import rabbitbus.bus as bus_mod
+    orig_error = bus_mod.logger.error
+    def _watch_park(msg, *args, **kwargs):
+        if "parked" in str(msg):
+            parked.set()
+        orig_error(msg, *args, **kwargs)
+    bus_mod.logger.error = _watch_park
+
+    recv = make_dl_bus(SVC_DL, max_attempts=2)
+    recv.handle_message(TMsg, handler)
+    recv.on_deadletter(on_deadletter)
+    recv.start()
+    send = make_bus(SVC_SEND)
+    send.register_message_type(TMsg)
+    send.start()
+    try:
+        send.send(SVC_DL, BusMessage(TMsg(data="poison")))
+        assert parked.wait(timeout=15), "message must be parked at the cap"
+        time.sleep(3)
+        assert len(dl_calls) == 1, f"callback must not run again: {len(dl_calls)}"
+        assert recv.queue_depth(SVC_DL) == 0, "parked message is acked away"
+    finally:
+        bus_mod.logger.error = orig_error
+        send.shutdown()
+        recv.shutdown(drain=True)
+    print("PASS deadletter cap: max_attempts parks the message, no re-loop")
+
+
+def test_delayed_retry():
+    """Transient failure republished to the retry exchange is redelivered
+    into the NORMAL handler after the TTL; foreign-queue x-death falls
+    through instead of hitting the deadletter path."""
+    seen = []
+    done = threading.Event()
+    first_at = []
+
+    def handler(invocation, message):
+        data = message.payload.data
+        seen.append(data)
+        if not first_at:
+            first_at.append(time.time())
+        if data == "first":
+            invocation.publish(
+                retry_exchange_name(SVC_DL), "", BusMessage(TMsg(data="second"))
+            )
+            raise RuntimeError("transient")
+        done.set()
+
+    recv = make_dl_bus(SVC_DL, delays=[2])
+    recv.handle_message(TMsg, handler)
+    # the original "first" delivery is rejected after republishing; swallow it
+    # as poison so it does not loop into the DLX while the test runs
+    recv.on_deadletter(lambda info, body: None)
+    recv.start()
+    send = make_bus(SVC_SEND)
+    send.register_message_type(TMsg)
+    send.start()
+    try:
+        send.send(SVC_DL, BusMessage(TMsg(data="first")))
+        assert done.wait(timeout=20), "retried message must reach the handler"
+        assert seen == ["first", "second"], f"no extra deliveries: {seen}"
+        assert time.time() - first_at[0] >= 1.5, "redelivery must be delayed ~2s"
+    finally:
+        send.shutdown()
+        recv.shutdown(drain=True)
+    print("PASS delayed retry: republished failure redelivered after ~2s")
+
+
+def test_foreign_xdeath_goes_to_handlers():
+    """An x-death naming another queue (e.g. dead-lettered from a retry
+    queue) arriving at the service exchange is normal work, not poison."""
+    got = threading.Event()
+    dl_calls = []
+
+    def handler(invocation, message):
+        got.set()
+
+    def on_deadletter(delivery_info, body):
+        dl_calls.append(1)
+
+    recv = make_dl_bus(SVC_DL)
+    recv.handle_message(TMsg, handler)
+    recv.on_deadletter(on_deadletter)
+    recv.start()
+    raw_conn = pika.BlockingConnection(pika.URLParameters(AMQP_URL))
+    raw_ch = raw_conn.channel()
+    try:
+        x_death = [{
+            "count": 1,
+            "exchange": "somewhere",
+            "queue": f"rbtest_foreign_{SUFFIX}",
+            "reason": "expired",
+            "routing-keys": ["other"],
+            "time": int(time.time()),
+        }]
+        body = json.dumps(
+            {"schema_name": "rbtest.TMsg", "payload": {"data": "foreign"}}
+        ).encode()
+        raw_ch.basic_publish(
+            exchange="",
+            routing_key=SVC_DL,
+            body=body,
+            properties=pika.BasicProperties(
+                headers={"x-msg-name": "rbtest.TMsg", "x-death": x_death},
+            ),
+        )
+        assert got.wait(timeout=15), "foreign x-death must hit normal handlers"
+        time.sleep(1)
+        assert not dl_calls, "foreign x-death must not invoke the deadletter cb"
+    finally:
+        raw_conn.close()
+        recv.shutdown(drain=True)
+    print("PASS foreign x-death: normal handlers, deadletter cb untouched")
+
+
 def main():
     raw_conn = pika.BlockingConnection(pika.URLParameters(AMQP_URL))
     raw_ch = raw_conn.channel()
@@ -188,6 +375,10 @@ def main():
         test_queue_depth_and_purge(bus, raw_ch)
         test_heartbeat_pump()
         test_consumer_reconnect()
+        test_deadletter_callback_once_no_loop()
+        test_deadletter_max_attempts_parks()
+        test_delayed_retry()
+        test_foreign_xdeath_goes_to_handlers()
 
         assert bus.deadletter_count() == 0, "no dlx configured -> 0"
         print("PASS deadletter_count() == 0 without dlx")
@@ -196,15 +387,19 @@ def main():
             bus.shutdown(drain=True)
         except Exception:
             pass
-        for q in (QUEUE, PURGE_QUEUE, SVC_PUB, SVC_RECV, SVC_SEND):
+        for q in (
+            QUEUE, PURGE_QUEUE, SVC_PUB, SVC_RECV, SVC_SEND, SVC_DL,
+            f"{SVC_DL}.retry.2s",
+        ):
             try:
                 raw_ch.queue_delete(queue=q)
             except Exception:
                 pass
-        try:
-            raw_ch.exchange_delete(exchange=EXCHANGE)
-        except Exception:
-            pass
+        for ex in (EXCHANGE, DLX, RETRY_EX):
+            try:
+                raw_ch.exchange_delete(exchange=ex)
+            except Exception:
+                pass
         raw_conn.close()
     print("ALL HARDENING TESTS PASSED")
 
